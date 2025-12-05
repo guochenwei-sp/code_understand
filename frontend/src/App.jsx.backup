@@ -1,0 +1,692 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import {
+  Layout, Menu, Button, Card, Table, Modal, Input, Form,
+  message, List, Typography, Select, Tag, Empty, Spin, AutoComplete, Tree
+} from 'antd';
+import {
+  RocketOutlined, FolderOpenOutlined, PlusOutlined,
+  ReloadOutlined, FileTextOutlined, ArrowLeftOutlined, SearchOutlined, AppstoreOutlined,
+  FolderOutlined
+} from '@ant-design/icons';
+import axios from 'axios';
+import CytoscapeComponent from 'react-cytoscapejs';
+import Editor, { loader } from '@monaco-editor/react';
+import * as monaco from 'monaco-editor';
+
+// Configure Monaco Editor to use the local npm package instance
+loader.config({ monaco });
+
+const { Header, Content, Sider } = Layout;
+const { Title, Text } = Typography;
+const { Option } = Select;
+const { DirectoryTree } = Tree;
+
+const API_BASE = 'http://127.0.0.1:8000';
+
+const ipcRenderer = window.require && window.require('electron') ? window.require('electron').ipcRenderer : null;
+
+const App = () => {
+  // --- Global State ---
+  const [view, setView] = useState('project-list'); 
+  const [currentProject, setCurrentProject] = useState(null);
+
+  // --- Project List State ---
+  const [projects, setProjects] = useState([]);
+  const [isModalVisible, setIsModalVisible] = useState(false);
+  const [form] = Form.useForm();
+  const [loadingProjects, setLoadingProjects] = useState(false);
+
+  // --- Project Detail State ---
+  const [files, setFiles] = useState([]);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [fileContent, setFileContent] = useState('');
+  
+  const [graphElements, setGraphElements] = useState(null);
+  const [filterKind, setFilterKind] = useState('function'); 
+  
+  const [loadingFiles, setLoadingFiles] = useState(false);
+  const [loadingGraph, setLoadingGraph] = useState(false);
+  const [loadingContent, setLoadingContent] = useState(false);
+  
+  // Search State
+  const [searchResults, setSearchResults] = useState([]);
+  
+  // Form State
+  const [rootPathInput, setRootPathInput] = useState('');
+
+  // DSM State
+  const [isDSMVisible, setIsDSMVisible] = useState(false);
+  const [dsmData, setDsmData] = useState(null);
+  const [loadingDSM, setLoadingDSM] = useState(false);
+
+  // Refs
+  const editorRef = useRef(null);
+  const monacoRef = useRef(null);
+  const cyRef = useRef(null);
+  const pendingJumpRef = useRef(null);
+  const treeContainerRef = useRef(null);
+  const [treeHeight, setTreeHeight] = useState(500);
+
+  // === Lifecycle ===
+  useEffect(() => {
+    if (view === 'project-list') {
+      fetchProjects();
+    }
+  }, [view]);
+
+  useEffect(() => {
+    let interval;
+    if (currentProject) {
+      fetchFiles(currentProject.id);
+      interval = setInterval(() => {
+        fetchFiles(currentProject.id, true);
+      }, 10000);
+    }
+    return () => clearInterval(interval);
+  }, [currentProject]);
+
+  useEffect(() => {
+    if (view === 'project-detail' && treeContainerRef.current) {
+        const observer = new ResizeObserver(entries => {
+            for (let entry of entries) {
+                setTreeHeight(entry.contentRect.height);
+            }
+        });
+        observer.observe(treeContainerRef.current);
+        return () => observer.disconnect();
+    }
+  }, [view, loadingFiles]);
+
+  useEffect(() => {
+    if (selectedFile) {
+      fetchGraph(selectedFile.id);
+      fetchFileContent(selectedFile.id);
+      analyzeFile(selectedFile.id);
+    } else {
+        setFileContent('');
+        setGraphElements(null);
+    }
+  }, [selectedFile, filterKind]);
+
+  // Handle pending jump
+  useEffect(() => {
+      if (!loadingContent && fileContent && pendingJumpRef.current && editorRef.current) {
+          const line = pendingJumpRef.current;
+          try {
+              editorRef.current.revealLineInCenter(line);
+              editorRef.current.setPosition({ lineNumber: line, column: 1 });
+              editorRef.current.focus();
+              editorRef.current.createDecorationsCollection([
+                {
+                    range: new window.monaco.Range(line, 1, line, 1),
+                    options: { isWholeLine: true, className: 'myLineDecoration' }
+                }
+              ]);
+          } catch (e) { console.error(e); }
+          pendingJumpRef.current = null;
+      }
+  }, [loadingContent, fileContent]);
+
+  // === Helper: Build Tree Data ===
+  const treeData = useMemo(() => {
+      if (!currentProject || files.length === 0) return [];
+
+              const rootPath = currentProject.root_path.replace(/\\/g, '/');      const tree = [];
+
+      // Helper to find or create folder node
+      const findOrCreateNode = (nodes, name, key) => {
+          let node = nodes.find(n => n.title === name);
+          if (!node) {
+              node = { title: name, key: key, children: [], isLeaf: false };
+              nodes.push(node);
+          }
+          return node;
+      };
+
+      files.forEach(file => {
+          // Normalize file path
+          const fullPath = file.path.replace(/\\/g, '/');
+          
+          // Get relative path parts
+          let relative = fullPath;
+          if (fullPath.startsWith(rootPath)) {
+              relative = fullPath.substring(rootPath.length);
+          }
+          // Remove leading slash
+          if (relative.startsWith('/')) relative = relative.substring(1);
+          
+          const parts = relative.split('/');
+          const fileName = parts.pop(); // Last part is file name
+          
+          let currentLevel = tree;
+          let currentKey = rootPath;
+
+          // Build directories
+          parts.forEach(part => {
+              currentKey += '/' + part;
+              const node = findOrCreateNode(currentLevel, part, currentKey);
+              currentLevel = node.children;
+          });
+
+          // Add file node
+          currentLevel.push({
+              title: fileName,
+              key: `file-${file.id}`, // Special prefix to distinguish files
+              isLeaf: true,
+              icon: <FileTextOutlined />,
+              data: file // Store full file object
+          });
+      });
+
+      // Sort tree: folders first, then files
+      const sortNodes = (nodes) => {
+          nodes.sort((a, b) => {
+              if (a.isLeaf === b.isLeaf) return a.title.localeCompare(b.title);
+              return a.isLeaf ? 1 : -1; // Folders first
+          });
+          nodes.forEach(n => {
+              if (n.children) sortNodes(n.children);
+          });
+      };
+      sortNodes(tree);
+
+      return tree;
+  }, [files, currentProject]);
+
+
+  // === API Calls ===
+  // (Same as before)
+  const fetchProjects = async () => {
+    setLoadingProjects(true);
+    try {
+      const res = await axios.get(`${API_BASE}/projects/`);
+      setProjects(res.data);
+    } catch (err) {
+      message.error('Failed to load projects');
+    } finally {
+      setLoadingProjects(false);
+    }
+  };
+
+  const createProject = async (values) => {
+    try {
+      const res = await axios.post(`${API_BASE}/projects/`, values);
+      message.success('Project created');
+      setIsModalVisible(false);
+      form.resetFields();
+      fetchProjects();
+      openProject(res.data);
+      triggerScan(res.data.id);
+    } catch (err) {
+      message.error('Failed to create project: ' + (err.response?.data?.detail || err.message));
+    }
+  };
+
+  const triggerScan = async (projectId) => {
+    try {
+      await axios.post(`${API_BASE}/projects/${projectId}/scan`);
+      message.info('Scanning started in background...');
+    } catch (err) {
+      message.error('Failed to start scan');
+    }
+  };
+
+  const fetchFiles = async (projectId, silent = false) => {
+    if (!silent) setLoadingFiles(true);
+    try {
+      const res = await axios.get(`${API_BASE}/projects/${projectId}/files`);
+      setFiles(res.data);
+    } catch (err) {
+      if (!silent) message.error('Failed to load files');
+    } finally {
+      if (!silent) setLoadingFiles(false);
+    }
+  };
+
+  const fetchGraph = async (fileId) => {
+    setLoadingGraph(true);
+    setGraphElements(null);
+    try {
+      const url = filterKind 
+        ? `${API_BASE}/graph/file?file_id=${fileId}&kind=${filterKind}`
+        : `${API_BASE}/graph/file?file_id=${fileId}`;
+        
+      const res = await axios.get(url);
+      if (res.data.elements && res.data.elements.nodes.length > 0) {
+        setGraphElements(CytoscapeComponent.normalizeElements(res.data.elements));
+      } else {
+        setGraphElements(null);
+      }
+    } catch (err) {
+      message.error('Failed to load graph');
+    } finally {
+      setLoadingGraph(false);
+    }
+  };
+
+  const fetchFileContent = async (fileId) => {
+      setLoadingContent(true);
+      try {
+          const res = await axios.get(`${API_BASE}/files/${fileId}/content`);
+          setFileContent(res.data.content);
+      } catch (err) {
+          message.error('Failed to load file content');
+          setFileContent('// Failed to load content');
+      } finally {
+          setLoadingContent(false);
+      }
+  };
+
+  const analyzeFile = async (fileId) => {
+      try {
+          const res = await axios.get(`${API_BASE}/files/${fileId}/analyze`);
+          const findings = res.data;
+          
+          if (monacoRef.current && editorRef.current) {
+              const model = editorRef.current.getModel();
+              const markers = findings.map(f => ({
+                  startLineNumber: f.line,
+                  startColumn: 1,
+                  endLineNumber: f.line,
+                  endColumn: 1000,
+                  message: f.message,
+                  severity: f.severity === 'error' ? 8 : 4
+              }));
+              monacoRef.current.editor.setModelMarkers(model, "owner", markers);
+          }
+      } catch (err) {
+          console.error("Analysis failed", err);
+      }
+  };
+
+  const fetchDSM = async () => {
+      setLoadingDSM(true);
+      try {
+          const res = await axios.get(`${API_BASE}/projects/${currentProject.id}/dsm`);
+          setDsmData(res.data);
+      } catch (err) {
+          message.error("Failed to load DSM");
+      } finally {
+          setLoadingDSM(false);
+      }
+  };
+
+  const handleSearch = async (value) => {
+      if (!value || value.length < 2) {
+          setSearchResults([]);
+          return;
+      }
+      try {
+          const res = await axios.get(`${API_BASE}/search`, {
+              params: { q: value, project_id: currentProject.id }
+          });
+          const options = res.data.map(item => ({
+              value: item.name,
+              label: (
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>{item.name}</span>
+                      <span style={{ color: '#888', fontSize: '12px' }}>
+                          {item.kind} • {item.file_path.split('\\').pop()}:{item.line}
+                      </span>
+                  </div>
+              ),
+              item: item
+          }));
+          setSearchResults(options);
+      } catch (err) {
+          console.error(err);
+      }
+  };
+
+  const onSelectSymbol = (value, option) => {
+      const symbol = option.item;
+      const targetFile = files.find(f => f.id === symbol.file_id) || { id: symbol.file_id, path: symbol.file_path };
+      setSelectedFile(targetFile);
+      pendingJumpRef.current = symbol.line;
+  };
+
+  const handleBrowseDirectory = async () => {
+      if (ipcRenderer) {
+          const result = await ipcRenderer.invoke('dialog:openDirectory');
+          if (result) {
+              form.setFieldsValue({ root_path: result });
+              setRootPathInput(result);
+          }
+      } else {
+          message.warn("Directory browsing is only available in Electron desktop app.");
+      }
+  };
+
+  // === Handlers ===
+
+  const openProject = (project) => {
+    setCurrentProject(project);
+    setView('project-detail');
+    setSelectedFile(null);
+    setGraphElements(null);
+    setFileContent('');
+    setSearchResults([]);
+  };
+
+  const handleBack = () => {
+    setView('project-list');
+    setCurrentProject(null);
+  };
+
+  const handleEditorDidMount = (editor, monaco) => {
+    editorRef.current = editor;
+    monacoRef.current = monaco;
+  };
+
+  const handleCy = (cy) => {
+      cyRef.current = cy;
+      cy.on('tap', 'node', (evt) => {
+          const node = evt.target;
+          const line = node.data('line');
+          if (line && editorRef.current) {
+              editorRef.current.revealLineInCenter(line);
+              editorRef.current.setPosition({ lineNumber: line, column: 1 });
+              editorRef.current.focus();
+              editorRef.current.createDecorationsCollection([
+                  {
+                      range: new window.monaco.Range(line, 1, line, 1),
+                      options: { isWholeLine: true, className: 'myLineDecoration' }
+                  }
+              ]);
+          }
+      });
+      cy.on('tap', 'edge', (evt) => {
+           const edge = evt.target;
+           const line = edge.data('line');
+           if (line && editorRef.current) {
+               editorRef.current.revealLineInCenter(line);
+               editorRef.current.setPosition({ lineNumber: line, column: 1 });
+               editorRef.current.focus();
+           }
+      });
+  };
+
+  const showDSM = () => {
+      setIsDSMVisible(true);
+      fetchDSM();
+  };
+
+  const onTreeSelect = (keys, info) => {
+      if (info.node.isLeaf) {
+          setSelectedFile(info.node.data);
+      }
+  };
+
+  // === Renderers ===
+
+  const renderProjectList = () => (
+    <div style={{ padding: '50px', maxWidth: '1000px', margin: '0 auto' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '20px' }}>
+        <Title level={2}>Projects</Title>
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => setIsModalVisible(true)}>
+          New Project
+        </Button>
+      </div>
+      <Table 
+        dataSource={projects} 
+        rowKey="id" 
+        loading={loadingProjects}
+        columns={[ 
+          { title: 'Name', dataIndex: 'name', key: 'name', render: text => <b>{text}</b> },
+          { title: 'Path', dataIndex: 'root_path', key: 'path' },
+          { title: 'Created', dataIndex: 'created_at', key: 'created', render: t => new Date(t).toLocaleDateString() },
+          { 
+            title: 'Action', 
+            key: 'action', 
+            render: (_, record) => (
+              <Button type="link" onClick={() => openProject(record)}>Open</Button>
+            ) 
+          } 
+        ]} 
+      />
+      <Modal
+        title="Create New Project"
+        open={isModalVisible}
+        onCancel={() => setIsModalVisible(false)}
+        onOk={() => form.submit()}
+      >
+        <Form form={form} layout="vertical" onFinish={createProject}>
+          <Form.Item name="name" label="Project Name" rules={[{ required: true }]}>
+            <Input placeholder="My C Project" />
+          </Form.Item>
+          <Form.Item name="root_path" label="Root Path" rules={[{ required: true }]}>
+            <div style={{ display: 'flex', gap: '8px' }}>
+                <Input 
+                    placeholder="E:\\workspace\\linux-kernel\\drivers"
+                    value={rootPathInput}
+                    onChange={(e) => {
+                        setRootPathInput(e.target.value);
+                        form.setFieldsValue({ root_path: e.target.value });
+                    }}
+                />
+                <Button onClick={handleBrowseDirectory}>Browse</Button>
+            </div>
+          </Form.Item>
+        </Form>
+      </Modal>
+    </div>
+  );
+
+  const renderDSM = () => {
+      // (Same DSM render code)
+      if (loadingDSM || !dsmData) return <Spin />;
+      const { files, matrix } = dsmData;
+      return (
+          <div style={{ overflow: 'auto', maxHeight: '600px' }}>
+              <table style={{ borderCollapse: 'collapse', fontSize: '10px' }}>
+                  <thead>
+                      <tr>
+                          <th></th>
+                          {files.map((f, i) => (
+                              <th key={f.id} style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)', padding: '5px', border: '1px solid #ddd' }}>{f.name} ({i+1})</th>
+                          ))}
+                      </tr>
+                  </thead>
+                  <tbody>
+                      {files.map((f, i) => (
+                          <tr key={f.id}>
+                              <td style={{ padding: '5px', border: '1px solid #ddd', fontWeight: 'bold' }}>{i+1}. {f.name}</td>
+                              {matrix[i].map((val, j) => {
+                                  const isDiagonal = i === j;
+                                  const hasLoop = !isDiagonal && val > 0 && matrix[j][i] > 0;
+                                  let bg = 'white';
+                                  if (isDiagonal) bg = '#f0f0f0';
+                                  else if (hasLoop) bg = '#ffcccc'; 
+                                  else if (val > 0) bg = '#e6f7ff';
+                                  return <td key={j} style={{ width: 30, height: 30, textAlign: 'center', border: '1px solid #eee', backgroundColor: bg, color: val > 0 ? '#000' : '#ccc' }}>{val > 0 ? val : '.'}</td>;
+                              })}
+                          </tr>
+                      ))}
+                  </tbody>
+              </table>
+          </div>
+      );
+  };
+
+  const renderProjectDetail = () => (
+    <Layout style={{ height: 'calc(100vh - 64px)' }}>
+      <Sider width={300} theme="light" style={{ borderRight: '1px solid #f0f0f0' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+          <div style={{ padding: '16px', borderBottom: '1px solid #f0f0f0', display: 'flex', flexDirection: 'column', gap: 10 }}>
+             <Button icon={<ReloadOutlined />} block onClick={() => triggerScan(currentProject.id)}>
+               Rescan Project
+             </Button>
+             <Button icon={<AppstoreOutlined />} block onClick={showDSM}>
+               Architecture DSM
+             </Button>
+          </div>
+          <div ref={treeContainerRef} style={{flex: 1, overflow: 'hidden'}}>
+              {loadingFiles ? <div style={{textAlign: 'center', padding: 20}}><Spin /></div> : (
+                 <DirectoryTree
+                     multiple
+                     height={treeHeight}
+                     onSelect={onTreeSelect}
+                     treeData={treeData}
+                     selectedKeys={selectedFile ? [`file-${selectedFile.id}`] : []}
+                     style={{ background: 'transparent' }}
+                 />
+              )}
+          </div>
+        </div>
+      </Sider>
+      
+      <Content style={{ display: 'flex', flexDirection: 'column' }}>
+        {selectedFile ? (
+          <>
+            <div style={{ height: '40px', padding: '0 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #ddd', background: '#f5f5f5' }}>
+              <Text strong>{selectedFile.path.split('\\').pop()}</Text>
+              <div>
+                <span style={{ marginRight: 8 }}>View Mode:</span>
+                <Select value={filterKind} onChange={setFilterKind} size="small" style={{ width: 150 }}>
+                  <Option value="">All Symbols</Option>
+                  <Option value="function">Functions Only</Option>
+                </Select>
+              </div>
+            </div>
+            
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', height: 'calc(100% - 40px)' }}>
+                {/* Top: Graph (40%) */}
+                <div style={{ height: '40%', borderBottom: '1px solid #ccc', position: 'relative' }}>
+                     {loadingGraph ? (
+                        <div style={{ height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                        <Spin size="large" tip="Building Graph..." />
+                        </div>
+                    ) : graphElements ? (
+                        <CytoscapeComponent
+                            elements={graphElements}
+                            cy={handleCy}
+                            style={{ width: '100%', height: '100%' }}
+                            layout={{
+                                name: 'cose', 
+                                animate: false, 
+                                componentSpacing: 80,
+                                nodeRepulsion: 800000,
+                                padding: 20
+                            }}
+                            stylesheet={[ 
+                                {
+                                    selector: 'node',
+                                    style: {
+                                        'background-color': 'data(color)',
+                                        'label': 'data(label)',
+                                        'color': '#333',
+                                        'font-size': '12px',
+                                        'width': '60px',
+                                        'height': '40px',
+                                        'padding': '5px',
+                                        'shape': 'round-rectangle',
+                                        'text-valign': 'center',
+                                        'text-halign': 'center',
+                                        'text-wrap': 'wrap',
+                                        'text-max-width': '100px',
+                                        'border-width': 1,
+                                        'border-color': '#888'
+                                    }
+                                },
+                                {
+                                    selector: 'edge',
+                                    style: {
+                                        'width': 2,
+                                        'line-color': 'data(color)',
+                                        'target-arrow-color': 'data(color)',
+                                        'target-arrow-shape': 'triangle',
+                                        'curve-style': 'bezier',
+                                        'label': 'data(label)',
+                                        'font-size': '10px',
+                                        'text-background-color': '#fff',
+                                        'text-background-opacity': 1,
+                                        'color': '#888'
+                                    }
+                                }
+                            ]}
+                        />
+                    ) : (
+                        <Empty description="No graph data" style={{ marginTop: 50 }} />
+                    )}
+                </div>
+
+                {/* Bottom: Editor (60%) */}
+                <div style={{ height: '60%', position: 'relative' }}>
+                    {loadingContent ? (
+                         <div style={{ height: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                            <Spin />
+                         </div>
+                    ) : (
+                        <Editor
+                            height="100%"
+                            defaultLanguage="c"
+                            value={fileContent}
+                            onMount={handleEditorDidMount}
+                            options={{
+                                readOnly: true,
+                                minimap: { enabled: true },
+                                scrollBeyondLastLine: false,
+                                automaticLayout: true
+                            }}
+                        />
+                    )}
+                </div>
+            </div>
+          </>
+        ) : (
+          <Empty description="Select a file to view analysis" style={{ marginTop: 150 }} />
+        )}
+      </Content>
+
+      <Modal 
+        title="Project Architecture DSM (Dependency Structure Matrix)" 
+        open={isDSMVisible} 
+        onCancel={() => setIsModalVisible(false)}
+        width={1000}
+        footer={null}
+      >
+          {renderDSM()}
+      </Modal>
+
+    </Layout>
+  );
+
+  return (
+    <Layout style={{ minHeight: '100vh' }}>
+      <Header style={{ display: 'flex', alignItems: 'center', background: '#001529', padding: '0 20px' }}>
+        <RocketOutlined style={{ fontSize: '20px', color: '#fff', marginRight: '10px' }} />
+        <Title level={4} style={{ color: '#fff', margin: 0, flex: 1 }}>CodeScope</Title>
+        
+        {view === 'project-detail' && (
+          <div style={{ marginRight: 20, width: 300 }}>
+             <AutoComplete
+                style={{ width: '100%' }}
+                placeholder="Search symbol (Ctrl+P)..."
+                options={searchResults}
+                onSearch={handleSearch}
+                onSelect={onSelectSymbol}
+             >
+                 <Input prefix={<SearchOutlined />} />
+             </AutoComplete>
+          </div>
+        )}
+
+        {view === 'project-detail' && (
+          <Button icon={<ArrowLeftOutlined />} onClick={handleBack} ghost>
+            Back to Projects
+          </Button>
+        )}
+      </Header>
+      
+      {view === 'project-list' ? renderProjectList() : renderProjectDetail()}
+      <style>{`
+        .myLineDecoration {
+            background: rgba(255, 255, 0, 0.3);
+            width: 100% !important;
+        }
+      `}</style>
+    </Layout>
+  );
+};
+
+export default App;
